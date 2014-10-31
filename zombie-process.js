@@ -18,7 +18,7 @@ process.on('message', function(m){
   var args = JSON.parse(m)
   
   createTest(args.url, args.depth, args.source, args.opts, function(err, results){    
-    process.send({stat: "success", results: results})
+    process.send({stat: "success", results: results, uri: args.url})
   })
 })
 
@@ -33,6 +33,10 @@ var createTest = module.exports = function(url, depth, source, opts, cb){
   var queue = []
     , results = {}
 
+  
+  // Zombie is a _horrible_ memory leaker. Keep reporting memory to parent process:
+  monitorMemory()
+
   var browser = new Zombie({silent:true, userAgent : CHROME_UA})
 
   browser.on('response', function(req, res){
@@ -44,7 +48,9 @@ var createTest = module.exports = function(url, depth, source, opts, cb){
   })
 
   browser.on('error', function(err){
-    emit('browser-error', err, url)
+    if (matchDomainWhitelist(url, opts.domains)){
+      emit('browser-error', err.toString(), url)
+    }
   })
 
   browser.on('loaded', function(req, res){
@@ -52,13 +58,17 @@ var createTest = module.exports = function(url, depth, source, opts, cb){
   })
 
   browser.visit(url, function(e){
+
     if (matchDomainWhitelist(url, opts.domains)){
-      if (browser.error){
-        emit('browser-error', browser.error, url)
+      if (e || browser.error){
+        var err = e || browser.error
+        emit('browser-error', err.toString(), url)
       } 
 
       browser.wait(function(){
-        parseLinks(url, queue, results, browser, depth, opts.depth)
+        if (parseable(url)){
+          parseLinks(url, queue, results, browser, depth, opts.depth)
+        }
         return cb(null, queue)
       })
 
@@ -72,18 +82,23 @@ var createTest = module.exports = function(url, depth, source, opts, cb){
 
 
 var parseLinks = function(url, queue, results, browser, depth, maxdepth){
-  // Parse out links
-  var links = browser.document.querySelectorAll('a')
+  try {
+    // Parse out links
+    var links = browser.document.querySelectorAll('a')
 
-  // links is NodeList, not array, can't forEach()
-  for (var i = 0; i< links.length; i++){
-    var href = links[i].href
-    emit('link-encountered', href, url)
-    if (goodUrl(href) && !results[href] && depth+1 < maxdepth) {
-      results[href] = 'pending'
-      queue.push([href, depth+1, url])
+    // links is NodeList, not array, can't forEach()
+    for (var i = 0; i< links.length; i++){
+      var href = links[i].href
+      emit('link-encountered', href, url)
+      if (goodUrl(href) && !results[href] && depth+1 < maxdepth) {
+        results[href] = 'pending'
+        queue.push([href, depth+1, url])
+      }
     }
-  }
+  } catch (e){
+    console.log("# Zombie error in", url, e.message);
+    emit('browser-error', e.toString(), url)
+  } 
 }
 
 var goodUrl = function(url){
@@ -91,7 +106,13 @@ var goodUrl = function(url){
   if (url.indexOf("mailto:") == 0) return false
   if (url.indexOf("itmss:") == 0) return false // iTunes link
   return true
+}
 
+
+// TODO - probably should be less aggressive...
+var parseable = function(url){
+  if (endsWith(url, '.mp4')) return false
+  return true
 }
 
 var matchDomainWhitelist = function(domain, whitelist){
@@ -99,6 +120,19 @@ var matchDomainWhitelist = function(domain, whitelist){
   return whitelist.indexOf(host) > -1
 }
 
+var endsWith = function(str, suffix){ // Until ES6!
+  return str.indexOf(suffix, str.length - suffix.length) !== -1;
+}
 
 
+var monitorMemory = function(){
 
+  var tick = function(){
+    var mem = process.memoryUsage()
+    emit('memory-usage', process.pid, mem.rss, mem.heapTotal, mem.heapUsed);
+
+    setTimeout(tick, 5000)
+  }
+
+  tick();
+}

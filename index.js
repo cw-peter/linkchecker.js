@@ -4,6 +4,7 @@
 
 var child_process = require('child_process')
   , path = require('path')
+  , resourceQueue = require('./resource-queue')
   , MAX_PROCESSES = process.env.LINK_TEST_MAX_PROCESSES || 5
 
 var testUrls = module.exports = function(startUrl, opts, cb){
@@ -13,87 +14,144 @@ var testUrls = module.exports = function(startUrl, opts, cb){
   opts.depth = opts.depth || 1
   opts.domains = opts.domains || ["localhost:3000"]
 
-  var queue = {}
-    , results = {} // Pages which have been searched (doesn't include scripts etc.)
+  var queue = resourceQueue()
+  queue.push(startUrl, {depth: 0, source:startUrl})
 
-  queue[startUrl] = [0, startUrl] // url, depth, source
+  startZombiePool(queue, opts, cb)
+
+}
 
 
-  var currProcesses = 1
+var startZombiePool = function(queue, opts, cb){
+  var zombies = 1
 
-  var testUrlIter = function(){
-    currProcesses -= 1
+  var zombieTick = function(err){
+    console.log("ZOMBIE TICK", err)
+    zombies --;
 
-    if (Object.keys(queue).length < 1){
-      if (currProcesses <= 0){
-        return cb.apply(this, arguments)
+    // Step 1. Check we aren't done.
+    if (queue.len() < 1){
+      if (zombies <= 0){
+        cb(null, queue.summary())
       }
       return;
     }
 
-    for (var i = currProcesses; i < Math.min(MAX_PROCESSES, Object.keys(queue).length); i++){ 
-      spawnZombieProcess(queue, results, currProcesses, opts, testUrlIter)
-      currProcesses ++;
+    // Step 2. Check we have enough Zombies.
+    for (var i = zombies; i < Math.min(MAX_PROCESSES, queue.len()); i++){ 
+      var z = new Zombie(queue, opts, zombieTick);
+      process.nextTick(z.munch.bind(z));
+      zombies ++
+
+      if (opts.emitter){
+        opts.emitter.emit('zombie-started', zombies)
+      }
     }
+
   }
 
-  testUrlIter()
+  zombieTick();
 }
 
 
+var Zombie = function(queue, opts, done){
 
-var spawnZombieProcess = function(queue, results, currProcesses, opts, done){
-  var k = Object.keys(queue).pop()
-    , d = queue[k][0]
-    , s = queue[k][1]
-    results[k] = 'pending' // Or we can get in cycles...
-    delete queue[k]
+  this.uri = null
+  this.cb = null
 
-  if (opts.emitter){
-    opts.emitter.emit('checking', k, d, s, Object.keys(queue).length, Object.keys(results).length, currProcesses);
+  this.z = child_process.fork(require.resolve('./zombie-process'), {})
+  this.done = done
+  this.queue = queue
+  this.opts = opts
+  this.emitter = this.opts.emitter
+
+  // Bind Child process events
+  this.z.on('message', this.handleMessage.bind(this));
+  this.z.on('exit', this.handleExit.bind(this))
+}
+
+Zombie.prototype.isBusy = function(){
+  return !!this.cb;
+}
+
+Zombie.prototype.handleMessage = function(msg){
+  if (msg.stat === 'event'){
+    return this.handleEvent(msg);
   }
+  if (msg.stat == 'success'){
+    return this.handleSuccess(msg);
+  }
+}
 
-  // ZombieJS is riddled with memory leaks. We'll just spawn a new one for each page... 
-  var z = child_process.fork(path.join(__dirname, 'zombie-process.js'), {})
+Zombie.prototype.handleEvent = function(ev){
+  if (this.emitter)
+    this.emitter.emit.apply(this.emitter, ev.args)
+}
 
-  z.on('message', function(res){
+Zombie.prototype.handleSuccess = function(res){
+  // put into queue
+  var q = res.results
+  q.forEach(function(v){
+    var url = v[0] 
+      , depth = v[1]
+      , source = v[2]
 
-    if (res.stat == 'event' && opts.emitter){
-      opts.emitter.emit.apply(opts.emitter, res.args)
-    }
-    
-    if (res.stat == 'success'){
-      // put into queue
-      var q = res.results
-      q.forEach(function(v){
-        var url = v[0] 
-          , depth = v[1]
-          , source = v[2]
-        
-        if (results[url] != undefined || queue[url] != undefined){
-          // Already searched...
-        } else if (url) {
-          queue[url] = [depth, source]
-        }
-      })
-      
-      z.removeListener('exit', exitListener)
-      z.kill("SIGTERM");
-      done()
-    }
+    this.queue.push(url, {depth:depth, source:source})
   })
 
-  var exitListener = function(){
-    // TODO - put item back in queue so we can retry
-    console.log("# Unexpected Exit from Zombie")
-    done()
-  }
-  z.on('exit', exitListener)
+  this.queue.resolve(this.uri, true)
+  var cb = this.cb;
+  this.uri = null
+  this.cb = null;
+  cb(null, res);
+}
 
-  z.send(JSON.stringify({
-    url: k
-  , depth : d
-  , source : s
-  , opts: opts
+
+Zombie.prototype.handleExit = function(){
+  console.log("# Unexpected Exit from Zombie")
+  this.queue.resolve(this.uri, false)
+  this.done(new Error("Unexpected exit"))
+}
+
+
+Zombie.prototype.die = function(){
+  this.z.removeListener('exit', this.handleExit)
+  this.z.kill("SIGTERM");
+}
+
+Zombie.prototype.munch = function(){
+  console.log("MUNCH")
+  if (this.queue.len() > 0) {
+    var resource = this.queue.pop()
+      , uri = resource[0]
+      , data = resource[1]
+    this.checkURI(uri, data.depth, data.source, this.opts, this.munch.bind(this));
+  } else {
+    return this.done(null);
+  }
+}
+
+
+Zombie.prototype.checkURI = function(uri, depth, source, cb){
+  if (this.isBusy()){
+    throw new Error("Zombie is busy")
+  }
+  
+  if (this.emitter){
+    this.emitter.emit('checking', uri, depth, source, this.queue.len(), this.queue.resolved().length);
+  }
+
+  this.cb = cb
+  this.uri = uri
+  this.z.send(JSON.stringify({
+      url: uri
+    , depth : depth
+    , source : source
+    , opts: this.opts
   }))
 }
+
+
+
+
+
