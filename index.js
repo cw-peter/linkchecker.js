@@ -6,6 +6,8 @@ var child_process = require('child_process')
   , path = require('path')
   , resourceQueue = require('./resource-queue')
   , MAX_PROCESSES = process.env.LINK_TEST_MAX_PROCESSES || 5
+  , MAX_PROCESS_HEAPSIZE = process.env.LINK_TEST_MAX_PROCESS_HEAPSIZE || 100000000
+
 
 var testUrls = module.exports = function(startUrl, opts, cb){
 
@@ -21,33 +23,36 @@ var testUrls = module.exports = function(startUrl, opts, cb){
 
 }
 
+module.exports.reporters = require('./reporters')
+
 
 var startZombiePool = function(queue, opts, cb){
-  var zombies = 1
+  var zombies = 0
 
   var zombieTick = function(err){
-    console.log("ZOMBIE TICK", err)
-    zombies --;
-
     // Step 1. Check we aren't done.
     if (queue.len() < 1){
       if (zombies <= 0){
         cb(null, queue.summary())
       }
-      return;
-    }
 
-    // Step 2. Check we have enough Zombies.
-    for (var i = zombies; i < Math.min(MAX_PROCESSES, queue.len()); i++){ 
-      var z = new Zombie(queue, opts, zombieTick);
-      process.nextTick(z.munch.bind(z));
-      zombies ++
+    } else {
+      // Step 2. Check we have enough Zombies.
+      for (var i = zombies; i < Math.min(MAX_PROCESSES, queue.len()); i++){ 
+        var z = new Zombie(queue, opts, function(){
+            zombies --;
+            zombieTick()
+          });
+        process.nextTick(z.munch.bind(z));
+        zombies ++
 
-      if (opts.emitter){
-        opts.emitter.emit('zombie-started', zombies)
+        if (opts.emitter){
+          opts.emitter.emit('zombie-started', zombies)
+        }
       }
     }
-
+    setTimeout(zombieTick, 1000)
+    return;
   }
 
   zombieTick();
@@ -59,7 +64,7 @@ var Zombie = function(queue, opts, done){
   this.uri = null
   this.cb = null
 
-  this.z = child_process.fork(require.resolve('./zombie-process'), {})
+  this.z = child_process.fork(require.resolve('./zombie-process'), {silent:true})
   this.done = done
   this.queue = queue
   this.opts = opts
@@ -86,17 +91,31 @@ Zombie.prototype.handleMessage = function(msg){
 Zombie.prototype.handleEvent = function(ev){
   if (this.emitter)
     this.emitter.emit.apply(this.emitter, ev.args)
+
+  if (ev.args[0] === 'memory-usage'){
+    this.handleMemory.apply(this, ev.args)
+  }
+}
+
+Zombie.prototype.handleMemory = function(ev, pid, rss, heapTotal, heapUsed){
+  if (heapTotal > MAX_PROCESS_HEAPSIZE){
+    if (this.emitter)
+      this.emitter.emit('zombie-too-much-memory', heapTotal)
+    this.die()
+  }
 }
 
 Zombie.prototype.handleSuccess = function(res){
   // put into queue
   var q = res.results
+    , self = this
+
   q.forEach(function(v){
     var url = v[0] 
       , depth = v[1]
       , source = v[2]
 
-    this.queue.push(url, {depth:depth, source:source})
+    self.queue.push(url, {depth:depth, source:source})
   })
 
   this.queue.resolve(this.uri, true)
@@ -108,7 +127,9 @@ Zombie.prototype.handleSuccess = function(res){
 
 
 Zombie.prototype.handleExit = function(){
-  console.log("# Unexpected Exit from Zombie")
+  if (this.emitter)
+    this.emitter.emit('zombie-died')
+
   this.queue.resolve(this.uri, false)
   this.done(new Error("Unexpected exit"))
 }
@@ -120,12 +141,11 @@ Zombie.prototype.die = function(){
 }
 
 Zombie.prototype.munch = function(){
-  console.log("MUNCH")
   if (this.queue.len() > 0) {
     var resource = this.queue.pop()
       , uri = resource[0]
       , data = resource[1]
-    this.checkURI(uri, data.depth, data.source, this.opts, this.munch.bind(this));
+    this.checkURI(uri, data.depth, data.source, this.munch.bind(this));
   } else {
     return this.done(null);
   }

@@ -48,7 +48,7 @@ var createTest = module.exports = function(url, depth, source, opts, cb){
   })
 
   browser.on('error', function(err){
-    if (matchDomainWhitelist(url, opts.domains)){
+    if (matchDomainWhitelist(url, opts.domains ) && parseable(url)){
       emit('browser-error', err.toString(), url)
     }
   })
@@ -66,9 +66,7 @@ var createTest = module.exports = function(url, depth, source, opts, cb){
       } 
 
       browser.wait(function(){
-        if (parseable(url)){
-          parseLinks(url, queue, results, browser, depth, opts.depth)
-        }
+        parseLinks(url, queue, results, browser, depth, opts.depth)
         return cb(null, queue)
       })
 
@@ -96,12 +94,12 @@ var parseLinks = function(url, queue, results, browser, depth, maxdepth){
       }
     }
   } catch (e){
-    console.log("# Zombie error in", url, e.message);
     emit('browser-error', e.toString(), url)
   } 
 }
 
 var goodUrl = function(url){
+  if (url.length === 0) return false
   if (url.indexOf("javascript:") == 0) return false
   if (url.indexOf("mailto:") == 0) return false
   if (url.indexOf("itmss:") == 0) return false // iTunes link
